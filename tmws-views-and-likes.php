@@ -21,7 +21,11 @@ namespace TMWS\ViewsAndLikes {
 
 		private const ENDPOINT_NAME = 'tmws-val-api';
 
-		private $meta_fields;
+		private $_meta_fields;
+
+		private $_valid_renderers;
+
+		private $_output_formats;
 
 		public function __construct() {
 
@@ -32,10 +36,36 @@ namespace TMWS\ViewsAndLikes {
 			add_action( 'init', [$this, 'add_rewrite_endpoint'] );
 			add_action( 'template_redirect', [$this, 'template_redirect'] );
 
-			$this->meta_fields = apply_filters( 'TMWS\\ViewsAndLikes\\ViewsAndLikes-meta_fields', [
+			add_action( 'wp_enqueue_scripts', [$this, 'register_scripts'] );
+
+			add_shortcode( 'tmws_val', [$this, 'shortcode'] );
+
+			add_action( 'tmws_val_render', [$this, 'render_action'] );
+			add_action( 'tmws_val_add_data', [$this, 'add_data'], 10, 2 );
+
+			add_action( 'wp_body_open', [$this, 'wp_body_open'] );
+
+			$this->_meta_fields = apply_filters( 'TMWS\\ViewsAndLikes\\ViewsAndLikes-meta_fields', [
 				'view'    => 'post_views',
 				'like'    => 'post_likes',
 				'dislike' => 'post_dislikes',
+			]);
+
+			$this->_valid_renderers = apply_filters('TMWS\\ViewsAndLikes\\ViewsAndLikes-valid_renderers', [
+				'view', 'like', 'dislike'
+			]);
+
+			$this->_output_formats = apply_filters('TMWS\\ViewsAndLikes\\ViewsAndLikes-output_formats', [
+				'single' => [
+					'view'    => 'view',
+					'like'    => 'like',
+					'dislike' => 'dislike',
+				],
+				'plural' => [
+					'view'    => 'view',
+					'like'    => 'like',
+					'dislike' => 'dislike',
+				],
 			]);
 		}
 
@@ -50,12 +80,13 @@ namespace TMWS\ViewsAndLikes {
 				return;
 			}
 
-			//$this->views_field = 'post_views'
+			//$this->view_field = 'post_views'
+			$actions = join( '|', array_keys($this->_meta_fields) );
 			$settings = [
 				'action' => [
 					'filter'  => FILTER_VALIDATE_REGEXP,
 					'options' => [
-						'regexp' => '`^(view|like|dislike)$`',
+						'regexp' => "`^(" . $actions . ")$`",
 						'default' => 'unknown',
 					]
 				],
@@ -64,9 +95,7 @@ namespace TMWS\ViewsAndLikes {
 				]
 			];
 
-			//extract(filter_input_array(INPUT_POST, $settings));
-
-			$input = filter_input_array(INPUT_GET, $settings);
+			$input = filter_input_array(INPUT_POST, $settings);
 
 			if (! ($input && is_array($input))) {
 				$this->_error_response(esc_html__('No or invalid input', 'tmws_val'));
@@ -85,14 +114,85 @@ namespace TMWS\ViewsAndLikes {
 			$result = ['action' => $action];
 
 			try {
-				$result = $this->set_data($post_id, $action);
+				$result = array_merge($result, $this->set_data($post_id, $action));
 			} catch (Exception $e) {
 				$this->_error_response($e->getMessage());
 			}
 
-			//get_current_user_id
+			$result['html'] = [];
+			foreach ($this->_valid_renderers as $type) {
+				$result['html'][$type] = $this->render_data($type, $post_id);
+			}
 
 			$this->_success_response($result);
+		}
+
+		public function register_scripts() {
+
+			wp_register_script('tmws-val-main', $this->_assets_url('js/main.js'), array('jquery'), null, true);
+			wp_localize_script('tmws-val-main', 'tmws_options', apply_filters('TMWS\\ViewsAndLikes\\ViewsAndLikes-main_js_data', [
+				'endpoint' => self::ENDPOINT_NAME,
+				'actions' => array_combine(array_keys($this->_meta_fields), array_keys($this->_meta_fields)),
+			]));
+			wp_enqueue_script('tmws-val-main');
+		}
+
+		public function wp_body_open() {
+
+			if( is_a( get_queried_object(), 'WP_Post' ) ) {
+
+				$post_id = get_queried_object_id();
+
+				$this->set_data($post_id, 'view');
+			}
+		}
+
+		public function shortcode( $atts, $content='', $shortcode_name='tmws_val' ) {
+
+			extract(shortcode_atts([
+				'type' => $this->_valid_renderers
+			], $atts, $shortcode_name));
+
+			if (empty($type)) {
+				$type = $this->_valid_renderers;
+			}
+
+			if ( !is_array($type) && is_string($type) ) {
+				$type = preg_split('`(,|;|\s)+`', $type);
+			}
+
+			return $this->_render_data_html($type);
+		} 
+
+		public function render_action( $type, $post_id=null, $echo=true ) {
+
+			$html = $this->_render_data_html($type, $post_id);
+
+			if($echo) {
+				echo $html;
+			} else {
+				return $html;
+			}
+		}
+
+		public function render_data($type, $post_id=null) {
+
+			if (! $post_id) {
+				$post_id = get_the_ID();
+			}
+
+			if (! $post_id) {
+				return '';
+			}
+
+			global $post;
+			if( ! $post ) {
+				$post = get_post($post_id);
+			}
+
+			$count = $this->get_data_count($post_id, $type);
+
+			return sprintf( _n( $this->{$type . '_format_single'}, $this->{$type . '_format_plural'}, $count, 'tmws_val' ), number_format_i18n( $count ) );
 		}
 
 		// Meta data
@@ -113,6 +213,17 @@ namespace TMWS\ViewsAndLikes {
 			}
 		}
 
+		public function get_data_count($post_id, $action) {
+
+			$data = $this->get_data($post_id, $action);
+
+			if (is_array($data)) {
+				return count($data);
+			}
+
+			return (int) $data;
+		}
+
 		public function set_data($post_id, $action) {
 
 			if ( ! is_numeric($post_id)) {
@@ -120,8 +231,6 @@ namespace TMWS\ViewsAndLikes {
 					'message' => esc_html__( 'Invalid user ID', 'tmws_val' ),
 				];
 			}
-
-			error_log(print_r($this->{$action . '_field'}, true));
 
 			if(! is_string($this->{$action . '_field'})) {
 				return [
@@ -134,7 +243,7 @@ namespace TMWS\ViewsAndLikes {
 			if ( 'view' === $action ) {
 
 				empty($data) ? $data = 1 : $data++;
-				update_post_meta($post_id, $this->views_field, $data);
+				update_post_meta($post_id, $this->view_field, $data);
 
 				return [
 					'message' => esc_html__( 'View added', 'tmws_val' ),
@@ -147,6 +256,14 @@ namespace TMWS\ViewsAndLikes {
 				return [
 					'message' => esc_html__( 'Invalid user', 'tmws_val' ),
 				];
+			}
+
+			if ( 'like' === $action ) {
+				$this->unset_data($post_id, 'dislike');
+			}
+
+			if ( 'dislike' === $action ) {
+				$this->unset_data($post_id, 'like');
 			}
 
 			if ( in_array($user_id, $data) ) {
@@ -215,6 +332,43 @@ namespace TMWS\ViewsAndLikes {
 			}
 		}
 
+		public function load_template($template, $args=[]) {
+
+			$template_located = locate_template('tmws-views-and-likes/' . $template . '.php');
+
+			if(empty($template_located)) {
+				$template_located  = trailingslashit( $this->plugin_dir . 'templates' ) . $template . '.php';
+			}
+
+			if( empty($template_located) || ! file_exists($template_located) ) {
+				return '';
+			}
+
+			try {
+				ob_start();
+				load_template($template_located, false, $args);
+				return ob_get_clean();
+			} catch (Exception $e) {
+				error_log($e->getMessage());
+			}
+
+			return '';
+		}
+
+		private function _render_data_html( $type, $post_id=null ) {
+
+			$output = '';
+
+			foreach ($type as $value) {
+
+				if(in_array($value, $this->_valid_renderers)) {
+					$output .= $this->render_data($value, $post_id);
+				}
+			}
+
+			return apply_filters( 'TMWS\\ViewsAndLikes\\ViewsAndLikes-html_output', $output );
+		}
+
 		private function _error_response($message = null) {
 
 			header( 'Content-Type: application/json' );
@@ -241,16 +395,33 @@ namespace TMWS\ViewsAndLikes {
 			exit;
 		}
 
+		private function _assets_url( $relpath ) {
+
+			return trailingslashit( $this->plugin_url . 'assets' ) . $relpath;
+		}
+
 		public function __get($var) {
 
-			error_log($var);
-
-			if ( 0 === preg_match( '`^(\w+)_field$`', $var, $maches ) ) {
-				return FALSE;
+			if ( 'plugin_url' === $var ) {
+				return plugin_dir_url(__FILE__);
 			}
 
-			if ( array_key_exists( $maches[1], $this->meta_fields )) {
-				return $this->meta_fields[$maches[1]];
+			if ( 'plugin_dir' === $var ) {
+				return plugin_dir_path(__FILE__);
+			}
+
+			if ( 0 !== preg_match( '`^(\w+)_field$`', $var, $maches ) ) {
+				
+				if ( array_key_exists( $maches[1], $this->_meta_fields )) {
+					return $this->_meta_fields[$maches[1]];
+				}
+			}
+
+			if ( 0 !== preg_match( '`^(\w+)_format_(single|plural)$`', $var, $maches ) ) {
+				
+				if ( array_key_exists( $maches[2], $this->_output_formats )) {
+					return $this->load_template($this->_output_formats[$maches[2]][$maches[1]]);
+				}
 			}
 
 			return FALSE;

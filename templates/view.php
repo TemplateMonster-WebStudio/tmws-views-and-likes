@@ -1,0 +1,1 @@
+<div class="post_views wrapper" title="<?= esc_attr__( 'Number of views', 'tmws_val' ) ?>"><span data-type="view" data-post_id="<?= get_the_ID() ?>"><i class="fa fa-eye"></i>%d</span></div>
